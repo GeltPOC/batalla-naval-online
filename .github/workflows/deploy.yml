@@ -1,0 +1,92 @@
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+
+      - name: Install sshpass and trust host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y sshpass
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.HETZNER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rsync build to Hetzner
+        env:
+          SSHPASS: ${{ secrets.HETZNER_PASSWORD }}
+        run: |
+          sshpass -e ssh ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }} "mkdir -p /home/gelt/apps/batalla-naval-online"
+          # IMPORTANTE: --delete borra ficheros del remoto que no estén en local.
+          # Excluimos rutas persistentes (BD PGlite, sqlite, data/) para NO
+          # destruir los datos de prod al redeployar. Si el proyecto guarda
+          # estado, debe usar uno de estos paths.
+          rsync -avz --delete \
+            -e "sshpass -e ssh" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.next/cache' \
+            --exclude='data/' \
+            --exclude='storage/' \
+            --exclude='uploads/' \
+            --exclude='*.db' \
+            --exclude='*.sqlite' \
+            --exclude='*.sqlite3' \
+            --exclude='*.pglite' \
+            --exclude='pglite-data/' \
+            ./ ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}:/home/gelt/apps/batalla-naval-online/
+
+      - name: Reload PM2 with correct Node version
+        env:
+          SSHPASS: ${{ secrets.HETZNER_PASSWORD }}
+        run: |
+          sshpass -e ssh ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }} bash -s <<'EOF'
+          set -ex
+          cd /home/gelt/apps/batalla-naval-online
+
+          export NVM_DIR="$HOME/.nvm"
+          if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+            echo "ERROR: nvm no encontrado en $NVM_DIR/nvm.sh"
+            exit 1
+          fi
+          . "$NVM_DIR/nvm.sh"
+
+          nvm install
+          nvm use
+
+          echo "Node activo: $(node -v)"
+          echo "npm activo:  $(which npm)"
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            echo "pm2 no encontrado en esta versión de Node, instalando local en $NVM_DIR..."
+            npm install -g pm2
+          fi
+          echo "pm2 activo:  $(which pm2)"
+
+          pm2 startOrReload ecosystem.config.js --update-env
+          pm2 save
+          EOF
+
+      - name: Update nginx routing for /batalla-naval-online
+        env:
+          SSHPASS: ${{ secrets.HETZNER_PASSWORD }}
+        run: |
+          sshpass -e ssh ${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }} bash -s <<'EOF'
+          set -e
+          mkdir -p /home/gelt/nginx-projects
+          echo "IyBBdXRvLWdlbmVyYXRlZCBieSBHZWx0IENvZGUgZm9yIHByb2plY3Q6IGJhdGFsbGEtbmF2YWwtb25saW5lCmxvY2F0aW9uIC9iYXRhbGxhLW5hdmFsLW9ubGluZSB7CiAgICBwcm94eV9wYXNzIGh0dHA6Ly8xMjcuMC4wLjE6Mzk3MDsKICAgIHByb3h5X2h0dHBfdmVyc2lvbiAxLjE7CiAgICBwcm94eV9zZXRfaGVhZGVyIEhvc3QgJGhvc3Q7CiAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLUZvciAkcHJveHlfYWRkX3hfZm9yd2FyZGVkX2ZvcjsKICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtUHJvdG8gJHNjaGVtZTsKICAgIHByb3h5X3NldF9oZWFkZXIgVXBncmFkZSAkaHR0cF91cGdyYWRlOwogICAgcHJveHlfc2V0X2hlYWRlciBDb25uZWN0aW9uICJ1cGdyYWRlIjsKICAgIHByb3h5X3JlYWRfdGltZW91dCA2MHM7Cn0K" | base64 -d > /home/gelt/nginx-projects/batalla-naval-online.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+          EOF
